@@ -37,7 +37,7 @@ def _build_server_cmd(args: argparse.Namespace, port: int) -> list[str]:
     cmd = [
         sys.executable,
         "-m",
-        "psi.deploy.psi0_serve_simple",
+        "psi.deploy.serve_psi0_simple",
         "--host",
         args.server_host,
         "--port",
@@ -55,6 +55,10 @@ def _build_server_cmd(args: argparse.Namespace, port: int) -> list[str]:
         cmd.extend(["--action-exec-horizon", str(args.action_exec_horizon)])
     if args.rtc:
         cmd.append("--rtc")
+    if args.rtc_inference_delay is not None:
+        cmd.extend(["--rtc-inference-delay", str(args.rtc_inference_delay)])
+    if args.min_exec_horizon is not None:
+        cmd.extend(["--min-exec-horizon", str(args.min_exec_horizon)])
     return cmd
 
 
@@ -83,6 +87,14 @@ def main() -> int:
     parser.add_argument("--wait-sleep-s", type=float, default=0.1)
     parser.add_argument("--server-log", help="Optional path for server stdout/stderr.")
     parser.add_argument("--rtc", action="store_true")
+    parser.add_argument("--rtc-inference-delay", type=int,
+                        help="RTC 'd': rows of each new chunk reproduced exactly from "
+                             "the previous plan. Required (>=1) for train-time RTC, "
+                             "whose frozen prefix is its only conditioning channel.")
+    parser.add_argument("--min-exec-horizon", type=int,
+                        help="RTC 's': the guidance mask's free-region boundary (H-s). "
+                             "Must be >= --action-exec-horizon. Raise it to pull the "
+                             "ramp back off the chunk seam.")
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     parser.add_argument("--save-video", action="store_true", default=True)

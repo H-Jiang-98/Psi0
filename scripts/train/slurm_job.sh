@@ -32,13 +32,38 @@ export XDG_CACHE_HOME="$H100_JOB_CACHE_ROOT/xdg-cache"
 export HF_DATASETS_CACHE="/var/lib/h100-job-cache/${USER:-songlinwei}/hf-datasets"
 mkdir -p "$HF_DATASETS_CACHE" 2>/dev/null || true
 
-# Node-local staged dataset
+# Node-local staged dataset.
+# The stage under /var/lib/h100-job-cache/data is SHARED by every dataset and user on
+# the node, so probing one hardcoded pack is wrong: a node holding somebody else's
+# pack still flipped PSI_DATA_ROOT, and a job whose own pack was not staged died with
+#   FATAL: missing pack /var/lib/h100-job-cache/data/<pack>        (job 1868)
+# Use the stage only when EVERY pack this job needs is actually on it; otherwise fall
+# back to beegfs, which is slower but always correct.
+#
+# The pack ids come from $PSI_STAGE_IDS when set, else from the TRAIN_ID / VAL_ID
+# lines of the recipe being launched. Set PSI_STAGE_IDS explicitly if a recipe takes
+# its ids from the environment instead of literals.
 PSI_LOCAL_DATA=/var/lib/h100-job-cache/data
-if [ -d "$PSI_LOCAL_DATA/psix_sonic_v1_train/data" ]; then
-    export PSI_DATA_ROOT="$PSI_LOCAL_DATA"
-    echo "Data root:   $PSI_DATA_ROOT (node-local stage)"
+_recipe=$(printf '%s\n' $TRAIN_CMD | head -1)
+if [ -z "${PSI_STAGE_IDS:-}" ] && [ -f "$_recipe" ]; then
+    PSI_STAGE_IDS=$(grep -E '^(TRAIN_ID|VAL_ID)=' "$_recipe" \
+        | sed -e 's/^[A-Za-z_]*=//' -e 's/"//g' -e 's/^\${[A-Za-z_]*:-//' -e 's/}$//' \
+        | sort -u | tr '\n' ' ')
+fi
+_staged=1; _miss=
+if [ -z "${PSI_STAGE_IDS:-}" ]; then
+    _staged=0; _miss=" (could not determine packs from $_recipe)"
 else
-    echo "Data root:   .data (BeeGFS - node not staged; expect metadata pressure)"
+    for _id in $PSI_STAGE_IDS; do
+        [ -d "$PSI_LOCAL_DATA/$_id/data" ] || { _staged=0; _miss="$_miss $_id"; }
+    done
+fi
+if [ "$_staged" = 1 ]; then
+    export PSI_DATA_ROOT="$PSI_LOCAL_DATA"
+    echo "Data root:   $PSI_DATA_ROOT (node-local stage: $PSI_STAGE_IDS)"
+else
+    echo "Data root:   .data (BeeGFS - not staged:$_miss; expect metadata pressure)"
+    echo "             stage it with: sudo bash scripts/data/stage_pack_local.sh $PSI_STAGE_IDS"
 fi
 
 # Enroot runtime/data/cache paths are managed by /etc/enroot/enroot.conf.d/10-h100-defaults.conf.

@@ -600,7 +600,20 @@ class FinetuneTrainer(Trainer):
             # for non-mixture dataset, we can use more workers to speed up data loading
             train_dataloader_kwargs["generator"] = g
             train_dataloader_kwargs["worker_init_fn"] = worker_init_fn
-            train_dataloader_kwargs["shuffle"] = True
+            sample_weights = getattr(train_dataset, "sample_weights", None)
+            if sample_weights is not None:
+                # Per-frame task weights (data.task_sample_weights). Same seeded generator on
+                # every rank, so accelerate's batch sharding sees one identical draw sequence,
+                # exactly as shuffle=True + generator does.
+                train_dataloader_kwargs["sampler"] = torch.utils.data.WeightedRandomSampler(
+                    sample_weights, num_samples=len(sample_weights), replacement=True, generator=g,
+                )
+                overwatch.info(
+                    f"Train sampler: WeightedRandomSampler over {len(sample_weights)} frames "
+                    f"(max weight {float(sample_weights.max()):.1f})"
+                )
+            else:
+                train_dataloader_kwargs["shuffle"] = True
 
         collator = PaddedCollatorForTogether(
             model_max_length=self.tokenizer.model_max_length,
@@ -837,6 +850,8 @@ class FinetuneTrainer(Trainer):
         }
         if vlm_feat_norm is not None:
             metrics["vlm_feat_norm"] = vlm_feat_norm.detach().item()
+        if losses.get("state_drop_frac") is not None:
+            metrics["state_drop_frac"] = float(losses["state_drop_frac"])
         return (self.accelerator.sync_gradients, metrics)
 
     @torch.no_grad()
@@ -1051,4 +1066,5 @@ class FinetuneTrainer(Trainer):
         
         loss_action = (loss_action * mask).sum(1)  # (B, Da)
         loss_action = (loss_action.mean(0) * self.loss_w).sum()
-        return {"loss": loss_action, "vlm_feat_norm": model_output.vlm_feat_norm}
+        return {"loss": loss_action, "vlm_feat_norm": model_output.vlm_feat_norm,
+                "state_drop_frac": getattr(model_output, "state_drop_frac", None)}

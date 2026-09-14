@@ -88,9 +88,47 @@ class LeRobotDatasetWrapper(torch.utils.data.Dataset):
 
     def __getitem__(self, idx) -> dict:
         return self.base_dataset[idx]
-    
+
     def __len__(self):
         return len(self.base_dataset)
+
+    def frame_task_weights(self, rules: dict[str, float]) -> torch.Tensor:
+        """Per-frame sampling weight from `rules` {task substring (lower) -> weight}.
+
+        Reads task_index straight off the parquet-backed hf_dataset (no per-row decode),
+        maps it through meta.tasks, and takes the max weight over matching rules
+        (1.0 when none match). Works for a single pack and for MultiLeRobotDataset
+        (per-pack indices concatenated in dataset order, matching __getitem__).
+        """
+        import numpy as np
+        packs = getattr(self.base_dataset, "_datasets", None) or [self.base_dataset]
+        chunks = []
+        for ds in packs:
+            task_index = np.asarray(ds.hf_dataset.with_format("numpy")["task_index"]).reshape(-1)
+            n_tasks = int(task_index.max()) + 1
+            per_task = np.ones(n_tasks, dtype=np.float64)
+            for ti, task in ds.meta.tasks.items():
+                t = str(task).lower()
+                ws = [w for sub, w in rules.items() if sub in t]
+                if ws:
+                    per_task[int(ti)] = max(ws)
+            chunks.append(per_task[task_index])
+        weights = np.concatenate(chunks)
+        assert len(weights) == len(self), f"weights {len(weights)} != frames {len(self)}"
+        boosted = weights != 1.0
+        if boosted.any():
+            share_uniform = boosted.mean()
+            share_weighted = weights[boosted].sum() / weights.sum()
+            logging.getLogger(__name__).info(
+                f"task_sample_weights {rules}: {int(boosted.sum())}/{len(weights)} frames boosted "
+                f"({share_uniform:.1%} of frames -> {share_weighted:.1%} of draws)"
+            )
+        else:
+            logging.getLogger(__name__).warning(
+                f"task_sample_weights {rules} matched no task in "
+                f"{[ds.repo_id for ds in packs]}; sampling stays uniform"
+            )
+        return torch.as_tensor(weights, dtype=torch.double)
 
     @property
     def episode_data_index(self):

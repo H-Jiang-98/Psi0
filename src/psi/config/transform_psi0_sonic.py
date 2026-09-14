@@ -37,6 +37,16 @@ class SonicRepackTransform(LerobotRepackTransform):
     num_past_frames: int = 0
     action_chunk_size: int = 30
 
+    # Temporal state augmentation (skipped when the transform kwargs carry no_aug=True,
+    # i.e. val split / deploy): the proprio state paired with (o_t, a_t..a_{t+Tp-1}) is s_{t+k} with
+    # k ~ U{-J..J} (J = state_temporal_jitter, in frames) instead of s_t, with probability
+    # state_temporal_jitter_prob; otherwise k = 0. The window is clamped to the episode
+    # by LeRobot (boundary frame repeated). Teaches the policy that the state may be a
+    # few frames off from the image (latency, a slightly different pose at the same
+    # scene) so it leans on vision when the two disagree. 0 = off.
+    state_temporal_jitter: int = 0
+    state_temporal_jitter_prob: float = 1.0
+
     pad_action_dim: int | None = None
     pad_state_dim: int | None = None
 
@@ -56,8 +66,10 @@ class SonicRepackTransform(LerobotRepackTransform):
             base_key, _ = parse_modality_key(a_key)
             delta[base_key] = [t/fps for t in range(self.action_chunk_size)]
         
+        J = self.state_temporal_jitter
         for s_key in self.state_keys:
-            delta[s_key] = [-t/fps for t in range(self.num_past_frames, -1, -1)]
+            # [-(past+J) .. +J]; __call__ slices the (past+1)-frame window at offset k.
+            delta[s_key] = [t/fps for t in range(-(self.num_past_frames + J), J + 1)]
 
         if self.action_mask_key is not None:
             delta[self.action_mask_key] = [t/fps for t in range(self.action_chunk_size)]
@@ -72,7 +84,15 @@ class SonicRepackTransform(LerobotRepackTransform):
             if idx is not None:
                 vals = vals[..., idx]
             state_parts.append(vals)
-        states = np.concatenate(state_parts, axis=-1)
+        states = np.concatenate(state_parts, axis=-1)  # (past+1+2J, Ds)
+        J = self.state_temporal_jitter
+        if J > 0:
+            k = 0
+            if not kwargs.get("no_aug", False) and np.random.rand() < self.state_temporal_jitter_prob:
+                k = int(np.random.randint(-J, J + 1))
+            # window index of s_t is past+J; keep the (past+1) frames ending at s_{t+k}
+            end = self.num_past_frames + J + k + 1
+            states = states[end - (self.num_past_frames + 1):end]
         if self.pad_state_dim is not None:
             states, _ = pad_to_len(states, self.pad_state_dim)
 
@@ -122,6 +142,11 @@ class SonicActionStateTransform(FieldTransform):
 
     normalize_state: bool = False  # whether to normalize states
     use_norm_mask: bool = False  # backward compatibility
+
+    # Gaussian noise on the NORMALIZED state (needs normalize_state; skipped when the
+    # transform kwargs carry no_aug=True): N(0, std) per dim in [-1, 1] units, skipping constant/padded dims,
+    # clipped back to [-1, 1]. 0.05 = 2.5% of a joint's min-max range. 0 = off.
+    state_noise_std: float = 0.0
 
     action_min: Optional[List[float]] = None
     action_max: Optional[List[float]] = None
@@ -176,6 +201,8 @@ class SonicActionStateTransform(FieldTransform):
         action_max = np.array(self.action_max, dtype=np.float32)
         if self.normalize_state:
             data["states"] = self.normalize_state_func(data["states"])
+            if self.state_noise_std > 0 and not kwargs.get("no_aug", False):
+                data["states"] = self.perturb_state(data["states"])
 
         # tolerate near-zero, not just exact zero
         ill_mask = np.abs(action_max - action_min) < 1e-4 * (np.abs(action_max) + np.abs(action_min) + 1e-8) 
@@ -209,6 +236,15 @@ class SonicActionStateTransform(FieldTransform):
         if np.isnan(current_state).any():
             current_state = np.nan_to_num(current_state, nan=0.0)
         return current_state
+
+    def perturb_state(self, states: np.ndarray) -> np.ndarray:
+        """Additive Gaussian noise on normalized states; constant (zero-range/padded) dims untouched."""
+        state_min = np.array(self.state_min, dtype=np.float32)
+        state_max = np.array(self.state_max, dtype=np.float32)
+        live = np.abs(state_max - state_min) >= 1e-4 * (np.abs(state_max) + np.abs(state_min) + 1e-8)
+        noise = np.random.normal(0.0, self.state_noise_std, size=states.shape).astype(np.float32)
+        noise *= live.astype(np.float32)
+        return np.clip(states + noise, -1, 1).astype(np.float32)
 
     def reverse_call(self, array: Any, **kwargs) -> Any:
         assert self.action_min is not None and self.action_max is not None

@@ -481,20 +481,26 @@ def train_loop(config: _config.TrainConfig):
         pad_dim = config.model.action_dim - state_dict["action_in_proj.weight"].shape[1]
         if pad_dim > 0:
             # eg., torch.Size([1024, 32]) -> torch.Size([1024, 36])
-            # Replicate the last 4 columns instead of padding with zeros
+            # Replicate the last 4 columns instead of padding with zeros.
+            def replicate_tail(t: torch.Tensor, pad: int, dim: int) -> torch.Tensor:
+                """The last `pad` slices along `dim`, cycling the whole tensor when `pad`
+                exceeds its width. Growing 32 -> 80 for g1-sonic-neck asks for 48 columns
+                from a 32-column matrix, where a plain `t[..., -pad:]` silently returns a
+                short tensor and the concat comes out the wrong width."""
+                cur = t.shape[dim]
+                if pad <= cur:
+                    return t.narrow(dim, cur - pad, pad)
+                reps = -(-pad // cur)  # ceil
+                return torch.cat([t] * reps, dim=dim).narrow(dim, 0, pad)
+
             w = state_dict["action_in_proj.weight"]
-            to_pad = w[:, -pad_dim:]
-            # to_pad = torch.zeros_like(w[:, -pad_dim:])
-            state_dict["action_in_proj.weight"] = torch.cat([w, to_pad], dim=1)
+            state_dict["action_in_proj.weight"] = torch.cat([w, replicate_tail(w, pad_dim, 1)], dim=1)
 
             b = state_dict["action_out_proj.bias"]
-            # b = torch.zeros_like(state_dict["action_out_proj.bias"])
-            state_dict["action_out_proj.bias"] = torch.cat([b, b[-pad_dim:]], dim=0)
+            state_dict["action_out_proj.bias"] = torch.cat([b, replicate_tail(b, pad_dim, 0)], dim=0)
 
             w = state_dict["action_out_proj.weight"]
-            to_pad = w[-pad_dim:, :]
-            # to_pad = torch.zeros_like(w[-pad_dim:, :])
-            state_dict["action_out_proj.weight"] = torch.cat([w, to_pad], dim=0)
+            state_dict["action_out_proj.weight"] = torch.cat([w, replicate_tail(w, pad_dim, 0)], dim=0)
 
         # https://github.com/Physical-Intelligence/openpi/issues/669
         state_dict["paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"] = \
@@ -519,27 +525,24 @@ def train_loop(config: _config.TrainConfig):
 
     countp = lambda m: sum(p.numel() for p in m.values() if p.requires_grad)
 
+    # What to leave out of the optimizer. `pytorch_freeze_patterns` defaults to the
+    # whole PaliGemma VLM, reproducing what the openpi-05 runs in this repo trained
+    # with; other useful patterns:
+    #   ".paligemma.model."                       whole VLM (default)
+    #   ".paligemma.model.language_model."        language tower only
+    #   ".paligemma.model.vision_tower."          vision tower only
+    #   ".paligemma.model.multi_modal_projector." projector only
+    #   ()                                        full finetune
+    #
+    # The action expert's lm_head stays in `trainables` under every pattern, as it
+    # always has. It is never called -- PaliGemmaWithExpertModel.forward() runs
+    # `gemma_expert.model` and `embed_tokens` is None -- so it receives no gradient
+    # and torch's AdamW never allocates state for it. Harmless; left alone.
     trainables = {}
-    for k,v in model.named_parameters():
-        # freeze language parts
-        # if not "paligemma.model.language_model." in k:
-
-        # freeze vision tower parts
-        # if not ".paligemma.model.vision_tower." in k:
-        
-        # freeze mm projector
-        # if not ".paligemma.model.multi_modal_projector." in k:
-        
-        # freeze paligemma VLM entirely
-        if not ".paligemma.model." in k:
-            trainables[k] = v
-
-        # always skip lm_head
-        if "paligemma_with_expert.gemma_expert.lm_head.weight" in k:
+    for k, v in model.named_parameters():
+        if any(pattern in k for pattern in config.pytorch_freeze_patterns):
             continue
-
-        # # full finetune
-        # trainables[k] = v
+        trainables[k] = v
 
     # disable grads for the untrainable parts
     for n,p in model.named_parameters():

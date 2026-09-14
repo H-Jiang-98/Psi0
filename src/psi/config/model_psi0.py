@@ -24,6 +24,7 @@ class Psi0ModelConfig(ModelConfig):
     img_chunk: int = 1 # ?
     n_cams: int = 1 
     use_obs: str = "add_token"
+    # DEPRECATED: kept only so legacy checkpoints load.
     dropout: float = 0.1
     noise_scheduler: str = "flow"
     train_diffusion_steps: int = 1000
@@ -87,8 +88,26 @@ class Psi0ModelConfig(ModelConfig):
     # layerwise  VLM conditioning fusion with action features
     vlm_layer_indices: Optional[List[int]] = None
 
-    # Random state drop (train-only): with this probability, zero the proprioceptive
+    # Random state drop (train-only): with this probability the proprioceptive state is dropped.
+    # Default mode (state token in the VLM context): the token is masked out of attention.
+    # With state_as_action_token: the normalized state VECTOR is zeroed before projection, so the
+    # token, its bias and its positional embedding stay in place whether or not it was dropped.
     state_drop_prob: float = 0.0
+
+    # Prepend the proprio state as token 0 of the ACTION stream ([state | a_1..a_Tp]) so it joins
+    # the action self-attention and AdaLN in every block, instead of being one token among the
+    # VLM context. 
+    state_as_action_token: bool = False
+
+    # With state_as_action_token: a dropped state (state_drop_prob) is replaced by a LEARNED
+    # null token instead of the zero vector's projection (Linear bias + state_pos). The zero
+    # vector is a legitimate pose in normalized space, so "no state" and "neutral joints" were
+    # aliased; a dedicated token lets the policy learn a distinct "state missing" embedding.
+    # Fresh parameter (missing from older action-header checkpoints; strict=False loads it).
+    state_null_token: bool = False
+
+    # DEPRECATED: kept only so legacy checkpoints load; use state_drop_prob instead.
+    state_feature_dropout: float = 0.2
 
     ################### qwen3vl ####################
     # Training Schedule

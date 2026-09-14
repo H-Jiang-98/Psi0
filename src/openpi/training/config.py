@@ -34,6 +34,66 @@ ModelType: TypeAlias = _model.ModelType
 Filter: TypeAlias = nnx.filterlib.Filter
 
 
+# --- ZED-mini G1 sonic+neck baseline arm -------------------------------------
+# The `scale13` roster the psi0 / psix arms train on: the seven round-1 packs that
+# were never recaptured, the two round-1 packs kept alongside their round-2 twins,
+# the three round-2 recaptures, and the new round-2 pillow pack. Round-1
+# throw_rubbish is deliberately absent -- trash is represented only by its
+# two-scene round-2 pack.
+ZEDMINI13_PACKS = (
+    "clean_table",
+    "make_bed",
+    "pick_cloth",
+    "pour_water",
+    "push_chair",
+    "storage",
+    "water_flower",
+    "pick_place",
+    "throw_flipper",
+    "pick_place_round2",
+    "throw_flipper_round2",
+    "throw_rubbish_round2",
+    "pick_pillow_round2",
+)
+# hand(14) + body_token(64) + neck(2), laid out by psi_policy.ZEDMINI_ACTION_SLICES.
+# The 45-D state is padded to the same width by PadStatesAndActions.
+ZEDMINI_ACTION_DIM = psi_policy.ZEDMINI_ACTION_DIM
+# pi0.5 writes the discretised state into the prompt: `Task: <instruction>, State:
+# <45 ints>;\nAction: `. Note TokenizePrompt runs BEFORE PadStatesAndActions, so it
+# sees the real 45-D state, not the 80-D padded one -- the padding costs nothing here.
+# Hard maximum over the 13 packs is 226 tokens (worst instruction, 38, against an
+# all-3-digit state), so this matches the value the earlier openpi-05 configs used
+# and still leaves 24 spare. Padding is masked but still occupies prefix positions,
+# so an oversized budget is not free.
+# See .logs/2026-08-06-Pi05_Zedmini13/prompt_breakdown.py.
+ZEDMINI_MAX_TOKEN_LEN = 250
+ZEDMINI_DATA_ROOT = f"{os.environ['PSI_HOME']}/.data/dataset/finetune"
+# Norm stats live with the run artifacts, not inside .data -- openpi would otherwise
+# write them into the dataset directory that live training jobs are reading.
+ZEDMINI_ASSETS_DIR = f"{os.environ['PSI_HOME']}/.runs/openpi-05/assets"
+
+
+def zedmini13_pack_roots() -> tuple[str, ...]:
+    """Absolute train-split roots for the 13 packs, resolved across both data roots.
+
+    `pick_place` and `pick_place_round2` were archived to `finetune_arxiv/` after
+    this roster was frozen (they were superseded by the merged
+    `pick_place_psix_train_val/` pack that the psix arms use). The bytes are the
+    same and the norm stats in `ZEDMINI_ASSETS_DIR` were computed over them, so
+    the fix is to find each pack wherever it lives rather than to change the
+    roster -- the same remap `scripts/train/psix/eval-heldout-val-psix.sh` does
+    for the identical reason. A pack missing from BOTH roots is left pointing at
+    the primary one so the launcher preflight names it.
+    """
+    roots = (ZEDMINI_DATA_ROOT, ZEDMINI_DATA_ROOT.replace("/finetune", "/finetune_arxiv"))
+    out = []
+    for pack in ZEDMINI13_PACKS:
+        rel = f"{pack}/{pack}_train/g1"
+        out.append(next((f"{r}/{rel}" for r in roots if os.path.isdir(f"{r}/{rel}")),
+                        f"{ZEDMINI_DATA_ROOT}/{rel}"))
+    return tuple(out)
+
+
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
     """Determines the location of assets (e.g., norm stats) that will be used to set up the data pipeline.
@@ -65,6 +125,11 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Roots of additional LeRobot datasets to train on as one stream. When set, the
+    # loader concatenates one dataset per root and `repo_id` is used only to name the
+    # norm-stats asset. Used by multi-pack finetunes (e.g. the 13 ZED-mini packs),
+    # which ship as one LeRobot dataset per task rather than one merged dataset.
+    repo_roots: tuple[str, ...] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -128,7 +193,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        _transforms.ResizeImages(*model_config.image_resolution),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -460,6 +525,52 @@ class LeRobotHFMDataConfig(DataConfigFactory):
         )
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotZedminiDataConfig(DataConfigFactory):
+    """The ZED-mini G1 sonic+neck finetune packs, loaded as one concatenated stream.
+
+    Each task ships as its own LeRobot dataset under
+    `<root>/<pack>/<pack>_train/g1`, so the roster is a list of roots rather than
+    a single repo id. `repo_id` names the norm-stats asset only.
+    """
+
+    # `<pack>/<pack>_train/g1` directories, absolute or relative to the repo root.
+    pack_roots: tuple[str, ...] = ()
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform({
+                    "observation/image": "observation.images.egocentric",
+                    "states": "observation.state",
+                    # The 80-D action is assembled in ZedminiInputs; the three groups
+                    # arrive as separate LeRobot columns, each already stacked over the
+                    # action horizon by `action_sequence_keys`.
+                    "actions/hand": "action",
+                    "actions/body_token": "action.body_token",
+                    "actions/neck": "action.neck",
+                    # The human instruction. `task` is only a pack id ("clean_table_1").
+                    "prompt": "task_description",
+                })
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[psi_policy.ZedminiInputs(model_type=model_config.model_type)],
+            outputs=[psi_policy.ZedminiOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repo_roots=tuple(self.pack_roots),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action", "action.body_token", "action.neck"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
     """
     Example data config for custom DROID dataset in LeRobot format.
@@ -520,6 +631,13 @@ class TrainConfig:
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+
+    # Substrings of parameter names to keep out of the optimizer on the PyTorch path.
+    # The default freezes the PaliGemma VLM, leaving the action expert and its
+    # projections trainable (693M of 3.6B) -- what every openpi-05 run in this repo
+    # has trained with. Set to () for a full finetune. The JAX path uses
+    # `freeze_filter` instead.
+    pytorch_freeze_patterns: tuple[str, ...] = (".paligemma.model.",)
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
@@ -907,7 +1025,7 @@ _CONFIGS = [
         data=RLDSDroidDataConfig(
             repo_id="droid",
             # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="/mnt/pi-data/kevin",
+            rlds_data_dir=f"{os.environ['PSI_HOME']}/data",
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
@@ -964,7 +1082,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig( # FIXME
-            repo_id= f"{os.environ['DATA_HOME']}/Hold_lunch_bag_with_both_hands_and_squat_to_put_on_the_coffee_table",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Hold_lunch_bag_with_both_hands_and_squat_to_put_on_the_coffee_table",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -991,7 +1109,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig(
-            repo_id= f"{os.environ['DATA_HOME']}/Pick_bottle_and_turn_and_pour_into_cup",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Pick_bottle_and_turn_and_pour_into_cup",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -1018,7 +1136,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig( # FIXME
-            repo_id= f"{os.environ['DATA_HOME']}/Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new_target_yaw",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new_target_yaw",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -1049,7 +1167,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig( # FIXME
-            repo_id= f"{os.environ['DATA_HOME']}/Pull_the_tray_out_of_chips_can_and_throw_the_can_into_trash_bin",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Pull_the_tray_out_of_chips_can_and_throw_the_can_into_trash_bin",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -1077,7 +1195,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig( # FIXME
-            repo_id= f"{os.environ['DATA_HOME']}/Push_cart_grasp_and_place_grapes_on_plate",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Push_cart_grasp_and_place_grapes_on_plate",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -1104,7 +1222,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig( # FIXME
-            repo_id= f"{os.environ['DATA_HOME']}/Put_dumpling_into_blanket_and_turn_around_and_pass_to_human",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Put_dumpling_into_blanket_and_turn_around_and_pass_to_human",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -1131,7 +1249,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig( # FIXME
-            repo_id= f"{os.environ['DATA_HOME']}/Remove_the_cap_turn_on_the_faucet_and_fill_the_bottle_with_water",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Remove_the_cap_turn_on_the_faucet_and_fill_the_bottle_with_water",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -1158,7 +1276,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig( # FIXME
-            repo_id= f"{os.environ['DATA_HOME']}/Rotate_to_pour_ham_into_plate_and_push_the_cart_forward",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Rotate_to_pour_ham_into_plate_and_push_the_cart_forward",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -1185,7 +1303,7 @@ _CONFIGS = [
             max_token_len=250,
         ),
         data=LeRobotHFMDataConfig( # FIXME
-            repo_id= f"{os.environ['DATA_HOME']}/Spray_the_bowl_and_wipe_it_and_stack_it_up",
+            repo_id= f"{os.environ['PSI_HOME']}/data/Spray_the_bowl_and_wipe_it_and_stack_it_up",
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
@@ -1477,6 +1595,64 @@ _CONFIGS = [
     # RoboArena configs.
     #
     *roboarena_config.get_roboarena_configs(),
+    #
+    # ZED-mini G1 sonic+neck baseline arm -- the same 13 packs, action semantics,
+    # canvas and schedule as the psi0 / psix arms, so the three are comparable.
+    #
+    TrainConfig(
+        name="pi05_zedmini13",
+        project_name="psi-psix-hlp",
+        num_workers=8,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            # 80-D = hand(14) + body_token(64) + neck(2); the 45-D state is padded to
+            # the same width by PadStatesAndActions.
+            action_dim=ZEDMINI_ACTION_DIM,
+            # 30 @ 30 Hz, matching the arms' action chunk.
+            action_horizon=30,
+            max_token_len=ZEDMINI_MAX_TOKEN_LEN,
+            # The camera's 7:4 frame scaled down proportionally onto the patch-14 grid:
+            # 12x21 = 252 tokens per image, so three slots cost 756 -- within 2% of the
+            # 768 the earlier openpi-05 runs spent at 224x224, which is the compute
+            # budget pi0.5 has always been trained at here. Unlike 224x224 it neither
+            # crops nor letterboxes, so all 252 tokens carry image (224x224 spends 43%
+            # of its tokens on the black bars a 7:4 frame leaves behind). Off the
+            # pretrained 16x16 grid, so SigLIP interpolates its position embeddings --
+            # which is why the vision tower is left trainable below.
+            image_resolution=(168, 294),
+        ),
+        data=LeRobotZedminiDataConfig(
+            repo_id="zedmini13",
+            pack_roots=zedmini13_pack_roots(),
+            assets=AssetsConfig(assets_dir=ZEDMINI_ASSETS_DIR, asset_id="zedmini13"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        pytorch_weight_path=f"{os.environ['PSI_HOME']}/cache/checkpoints/openpi/pi05_droid",
+        # Language tower frozen, as in the stock openpi-05 recipe. The vision tower
+        # and projector are left trainable: SigLIP is being fed an 18x32 patch grid
+        # interpolated off its pretrained 16x16, and frozen it could never adapt to
+        # that canvas.
+        pytorch_freeze_patterns=(".paligemma.model.language_model.",),
+        # Schedule mirrors the psi0 arm (scripts/train/psi0/finetune-sonic-neck-zedmini.sh).
+        seed=292285,
+        num_train_steps=80_000,
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=80_000,
+            decay_lr=1e-8,
+        ),
+        save_interval=10_000,
+        keep_period=10_000,
+        checkpoint_base_dir=".runs/openpi-05",
+        policy_metadata={
+            "dataset": "zedmini13",
+            # Eval/deploy must slice with these: the psi0 arm orders the same three
+            # groups differently (body_token ++ hand ++ neck).
+            "action_layout": {k: list(v) for k, v in psi_policy.ZEDMINI_ACTION_SLICES.items()},
+        },
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

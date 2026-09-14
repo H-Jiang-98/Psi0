@@ -1,3 +1,9 @@
 {
-    "Push_refrigerator_door": "Push refrigerator door."
+    "pick_place_1": "pick up the green grapes and place it into the green bowl",
+    "pick_place_2": "pick up the blue hippo toy and place it into the green bowl",
+    "pick_place_3": "pick up the red tomato toy and place it into the green bowl",
+    "pick_place_4": "pick up the yellow corn toy and place it into the green bowl",
+    "pour_water_1": "grasp the transparent bottle and pour water into the kettle",
+    "pour_water_2": "grasp the white paper cup and pour water into the kettle",
+    "pour_water_3": "grasp the silver bottle and pour water into the kettle"
 }

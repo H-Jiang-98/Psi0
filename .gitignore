@@ -12,6 +12,7 @@ wheels/
 #/data/
 cache
 *.mp4
+!baselines/dreamzero/debug_image/*.mp4
 ml-egodex_dataset/ # soft link to the egodex dataset
 wandb/
 runs/
@@ -28,6 +29,7 @@ tmp_dir/
 
 .env
 .env.local
+.notion_pages/
 
 _lerobot_build
 .cache
@@ -39,10 +41,9 @@ _lerobot_build
 
 vq/
 extern/vq_bet_official/
-src/fast/egodex-*
+src/fast/batch_actions_*.npy
+src/fast/egodex-rel-10w-mix-40x48-v2048-s10/
 *.pkl
-!src/fast/egodex-rel-50w-1x48-v2048-s100
-src/fast/pi
 
 .deepspeed_env
 *.bak
@@ -57,4 +58,37 @@ test.py
 *.npy
 unitree_sdk2_python
 src/h_rdt/datasets/pretrain/egodex_large_values.txt
+
+.claude
+.cursor/
+.codex
+.cursor/
+/docs/
+scripts_slurm/
+scripts/docs/
+scripts/debug
+scripts/train/high_level_policy/*.slurm
 .egoverse
+wandb_config.json
+# fixme: for dreamzero
+experiment_cfg/*
+
+*.old.py
+
+data/anno/data
+data/anno/manual
+reports/
+
+.profile*
+
+scripts/data/EGODEX_TO_PSIX_CONVERTER_PLAN.md
+# this-cluster-only slurm wrappers and smoke copies
+scripts/train/psix/pretrain-egodex-psix-v2.slurm
+scripts/train/psix/.smoke-psix-v2.sh
+scripts/train/psix/.smoke-psix-v2.slurm
+
+# Cluster-local launch wrappers (vision-only; do not commit).
+*.slurm
+
+# Local, machine-specific deployment runbook; never commit.
+2machines.md

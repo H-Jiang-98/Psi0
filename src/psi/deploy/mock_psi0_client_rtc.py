@@ -88,7 +88,13 @@ def parse_args():
                    help="Per-action receive timeout (s); first action waits through model warmup.")
     p.add_argument("--output-dir", type=str,  default=None)
     p.add_argument("--rollout", type=Path, default=None)
-    p.add_argument("--max-allowed-frames", type=int, default=None)
+    p.add_argument("--max-allowed-frames", type=int, default=None,
+                   help="Cap on the number of frames actually replayed (after --stride).")
+    p.add_argument("--stride",    type=int,   default=1,
+                   help="Keep every Nth frame of the episode (1 = every frame). Note this "
+                        "subsamples content only: frames still go out at --target-hz, so a "
+                        "stride>1 replays the episode faster than real time unless you also "
+                        "drop --target-hz to fps/stride.")
     p.add_argument("--save-replay", action="store_true",
                    help="Dump the predicted actions as a record_sonic.py-style pickle that "
                         "hongyi-wbc/sim_replay/replay_in_mujoco.sh can stream into the sim.")
@@ -407,8 +413,8 @@ def main():
     
     # load inference rollout data
     if args.rollout is not None:
-        data_cfg.root_dir = args.rollout.parent
-        data_cfg.train_repo_ids = [args.rollout.name]
+        data_cfg.root_dir = str(args.rollout.parent)
+        data_cfg.train_repo_ids = data_cfg.val_repo_ids = [args.rollout.name]
 
     vlm_processor = load_vlm_processor(QWEN3VL_VARIANT)
     dataset = data_cfg(split=args.split, transform_kwargs=dict(vlm_processor=vlm_processor, no_aug=True))
@@ -423,16 +429,21 @@ def main():
     episode_index = dataset.raw_dataset.base_dataset.episode_data_index
     start = int(episode_index["from"][args.eps_idx].item())
     end   = int(episode_index["to"][args.eps_idx].item())
+    assert args.stride >= 1, f"--stride must be >= 1, got {args.stride}"
     if args.max_allowed_frames is not None:
-        end = min(end, start + args.max_allowed_frames)
-        
-    overwatch.info(f"Episode {args.eps_idx}: frames [{start}, {end}) -> {end - start} frames")
+        # The cap counts frames actually sent, so it spans max_allowed_frames * stride
+        # raw rows -- identical to the old behaviour at stride 1.
+        end = min(end, start + args.max_allowed_frames * args.stride)
+
+    indices = range(start, end, args.stride)
+    overwatch.info(f"Episode {args.eps_idx}: frames [{start}, {end}) stride {args.stride} "
+                   f"-> {len(indices)} frames")
 
     # Keep only what the replay actually sends. A full dataset item drags the VLM
     # processor output along (pixel_values is ~7 MB/frame for a 384x672 image), which
     # OOMs the box on a ~1k-frame episode; the slim view is ~1 MB/frame.
     frames = [_slim_frame(dataset[i])
-              for i in tqdm(range(start, end), desc="Loading episode frames", unit="frame")]
+              for i in tqdm(indices, desc="Loading episode frames", unit="frame")]
     if not frames:
         raise RuntimeError("No frames found for the given episode index.")
     dataset_name = frames[0].get("dataset_name")
@@ -465,6 +476,9 @@ def main():
         # Recorded rate, not --target-hz: the pickle is replayed at the episode's own rate.
         meta = getattr(dataset.raw_dataset, "meta", None)
         fps = float(getattr(meta, "fps", args.target_hz)) if meta is not None else args.target_hz
+        # Every kept frame stands for `stride` recorded steps, so the dump has to be
+        # streamed that much slower to cover the same wall-clock as the recording.
+        fps /= args.stride
         task = frames[0]["instruction"]
         states = np.stack(sent_states[:n_pairs])
         out_dir = Path(args.output_dir)

@@ -56,6 +56,31 @@ class CenterCrop(BaseModel):
         return v2.CenterCrop(self.size)
 
 
+class RandomViewPerturb(BaseModel):
+    """Mild viewport jitter: crop a random window whose sides are min_scale..1 of the
+    image (aspect ratio kept, random position) and resize it back to `size`, so the
+    policy sees the scene as if the camera were slightly shifted / closer. Applied
+    with probability `prob`."""
+    size: tuple[int, int] = (224, 224)  # H,W of the output (= the un-augmented resolution)
+    min_scale: float = 0.85             # min crop side fraction; 1.0 = identity
+    prob: float = 1.0
+
+    def __call__(self):
+        try:
+            from torchvision.transforms import v2
+        except:
+            from torchvision import transforms as v2
+        H, W = self.size
+        crop = v2.RandomResizedCrop(
+            (H, W),
+            scale=(self.min_scale ** 2, 1.0),   # area fraction -> side fraction in [min_scale, 1]
+            ratio=(W / H, W / H),               # keep the aspect ratio: no distortion
+            interpolation=v2.InterpolationMode.BILINEAR,
+            antialias=True,
+        )
+        return crop if self.prob >= 1.0 else v2.RandomApply([crop], p=self.prob)
+
+
 class RandomCrop(BaseModel):
     size: int | tuple[int, int] = (224, 224)  # H,W
     pad_if_needed: bool = True  # pad when the input is smaller than the crop

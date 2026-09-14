@@ -49,6 +49,8 @@ class HumanFoundationModelOutput(BaseOutput):
     action: "torch.Tensor"  # noqa: F821
     # Mean per-token L2 norm of the VLM feature fed to the action header (for logging).
     vlm_feat_norm: Optional["torch.Tensor"] = None  # noqa: F821
+    # Fraction of the batch whose proprio state was dropped (state_as_action_token, train-time).
+    state_drop_frac: Optional[float] = None
 
     def to_tuple(self):
         return (None, self.action)
@@ -421,10 +423,10 @@ class JointVLAAttnProcessor: #(nn.Module):
             key = torch.cat([key, encoder_hidden_states_key_proj], dim=2)
             value = torch.cat([value, encoder_hidden_states_value_proj], dim=2)
             if attention_mask is not None:
-                assert attention_mask.dtype == torch.float32
+                assert not attention_mask.is_floating_point() or attention_mask.dtype == torch.float32, attention_mask.dtype
                 attn_mask = torch.cat([
-                    torch.ones(hidden_states.shape[0], 1, 1, hidden_states.shape[1], device=attention_mask.device).to(torch.bool),  # (B, 1, 1, S1)
-                    (attention_mask == 1)[:, None, None, :]  # (B, 1, 1, S2)
+                    torch.ones(hidden_states.shape[0], 1, 1, hidden_states.shape[1], device=attention_mask.device, dtype=torch.bool),  # (B, 1, 1, S1)
+                    attention_mask.to(torch.bool)[:, None, None, :]  # (B, 1, 1, S2)
                 ], dim=-1)
             else:
                 attn_mask = None
@@ -470,7 +472,10 @@ class ObservationProjection(nn.Module): # FIXME naming
         resnet_store_path: str = "cache/visual_features/resnet18/IN_1M_resnet18.pth",
         odim: int = 32,
         view_feature_dim: int = 1920,
-        use_film: bool = False
+        use_film: bool = False,
+        obs_strat: Optional[str] = "add_token",  # "add_token" | None (state handled elsewhere)
+        dropout: float = 0.1,                    # @see model_cfg.dropout -- context-token dropout
+        state_feature_dropout: float = 0.2,      # @see model_cfg.state_feature_dropout
     ):
         super().__init__()
 
@@ -615,13 +620,18 @@ class ObservationProjection(nn.Module): # FIXME naming
 
         self.film = FilmConditioning(2048, output_dim) if use_film else None
 
-        self._obs_strat = "add_token"
-        self._n_tokens += 1
+        assert obs_strat in ("add_token", None), f"unsupported obs_strat {obs_strat!r}"
+        self._obs_strat = obs_strat
+        if self._obs_strat == "add_token":
+            self._n_tokens += 1
 
+        # state_feature_dropout=0 disables the per-dim state corruption entirely; legacy
+        # checkpoints back-fill 0.2 (see LEGACY_MODEL_CONFIG_DEFAULTS in psi/utils/utils.py).
+        # Bypassed by construction when state_as_action_token=True -- that path takes
+        # _obs_proc[1], the Linear alone.
         self._obs_proc = nn.Sequential(
-            nn.Dropout(p=0.2), nn.Linear(odim, output_dim)
+            nn.Dropout(p=state_feature_dropout), nn.Linear(odim, output_dim)
         )
-        dropout = 0.1 # @see model_cfg.dropout
         linear_proj = nn.Identity() # build (optional) token feature projection layer 
         norm = nn.Identity() # feat_norm = None
         self.post_proc = nn.Sequential(linear_proj, norm, nn.Dropout(dropout))
@@ -636,7 +646,8 @@ class ObservationProjection(nn.Module): # FIXME naming
                 # ac_flat = None, 
                 # mask_flat = None, 
                 text_embeddings = None, 
-                vlm_attn_mask=None
+                vlm_attn_mask=None,
+                obs_keep=None
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
@@ -650,7 +661,7 @@ class ObservationProjection(nn.Module): # FIXME naming
         """
         # DiffusionTransformerAgent.forward
         vlm_token_len = views.shape[1] * views.shape[2]  # V*S VLM tokens, right-padded
-        s_t, out_attn_mask = self.tokenize_obs(views, obs, traj2ds, text_embeddings=text_embeddings, vlm_attn_mask=vlm_attn_mask) # (B, S, d_model)
+        s_t, out_attn_mask = self.tokenize_obs(views, obs, traj2ds, text_embeddings=text_embeddings, vlm_attn_mask=vlm_attn_mask, obs_keep=obs_keep) # (B, S, d_model)
         # _DiTNoiseNet.forward_enc
         s_t = s_t.transpose(0, 1) # (S, B, d_model)
         s_t = self._add_obs_pos(s_t, vlm_token_len) # (S, B, d_model)
@@ -667,7 +678,7 @@ class ObservationProjection(nn.Module): # FIXME naming
         obs_pos = self.enc_pos.pe[:n_obs].to(s_t.dtype)  # (n_obs, 1, d_model)
         return torch.cat([s_t[:vlm_token_len], s_t[vlm_token_len:] + obs_pos], dim=0)
 
-    def tokenize_obs(self, views, obs, traj2ds = None, flatten=False, text_embeddings=None, vlm_attn_mask=None):
+    def tokenize_obs(self, views, obs, traj2ds = None, flatten=False, text_embeddings=None, vlm_attn_mask=None, obs_keep=None):
         
         view_tokens = self.views_proj(views)
         B,V,S,D = view_tokens.shape
@@ -722,10 +733,19 @@ class ObservationProjection(nn.Module): # FIXME naming
             obs_token = self._obs_proc(obs)#[:, None]
             tokens = torch.cat((tokens, obs_token), 1)
             obs_token_len = obs_token.shape[1]
-            vlm_attn_mask = (
-                torch.cat([vlm_attn_mask, torch.ones((B, obs_token_len), device=vlm_attn_mask.device)], 1) 
-                if vlm_attn_mask is not None else None
-            )
+            # State-token dropout. 
+            obs_mask = torch.ones((B, obs_token_len), device=tokens.device, dtype=torch.float32)
+            if obs_keep is not None:
+                obs_mask = obs_mask * obs_keep.view(B, 1).to(obs_mask.dtype)
+            if vlm_attn_mask is not None:
+                vlm_attn_mask = torch.cat([vlm_attn_mask.to(obs_mask.dtype), obs_mask], 1)
+            elif obs_keep is not None:
+                # No VLM mask to extend (unpadded single-sample path): synthesize an
+                # all-visible one over the context tokens so the drop still takes effect.
+                n_ctx = tokens.shape[1] - obs_token_len
+                vlm_attn_mask = torch.cat(
+                    [torch.ones((B, n_ctx), device=tokens.device, dtype=torch.float32), obs_mask], 1
+                )
         elif self._obs_strat == "pad_img_tokens":
             obs = self._obs_proc(obs)
             obs = obs[:, None].repeat((1, tokens.shape[1], 1))
@@ -733,6 +753,10 @@ class ObservationProjection(nn.Module): # FIXME naming
             vlm_attn_mask = None
         else:
             assert self._obs_strat is None
+            if vlm_attn_mask is not None:
+                # state_as_action_token: no obs token is appended here, so nothing casts the
+                # collator's bool mask (input_ids.ne(pad)); the attn processor wants fp32.
+                vlm_attn_mask = vlm_attn_mask.to(torch.float32)
 
         tokens = self.post_proc(tokens)
         if flatten:
@@ -1142,12 +1166,19 @@ class ActionTransformerModel(
         final_layer_norm: bool = True,
         layerwise_vlm_fusion: bool = False,
         state_drop_prob: float = 0.0,
+        state_as_action_token: bool = False,
+        state_null_token: bool = False,
+        dropout: float = 0.1,
+        state_feature_dropout: float = 0.2,
     ):
         super().__init__()
         # self.inner_dim = num_attention_heads * attention_head_dim
         self.inner_dim = num_attention_heads * attention_head_dim
 
         self.state_drop_prob = state_drop_prob
+        self.state_as_action_token = state_as_action_token
+        # Fraction of samples whose state was dropped in the last forward (train-time logging).
+        self.last_state_drop_frac: Optional[float] = None
         self.combined_temb = combined_temb
         if self.combined_temb:
             self.time_ins_embed = CombinedTimestepTextProjEmbeddingsND(
@@ -1168,11 +1199,27 @@ class ActionTransformerModel(
             resnet_store_path=resnet_store_path,
             odim=odim,
             view_feature_dim=view_feature_dim,
-            use_film=use_film
+            use_film=use_film,
+            # state_as_action_token: the state leaves the VLM context and becomes action token 0
+            obs_strat=None if state_as_action_token else "add_token",
+            dropout=dropout,
+            state_feature_dropout=state_feature_dropout,
         )
 
         total_params = sum(p.numel() for p in self.obs_proj.parameters() if p.requires_grad)
         logger.debug(f"ObservationEncoder parameters: {total_params:,}")
+
+        if self.state_as_action_token:
+            # Learned position for the state token at index 0 of the action stream. Zero-init so a
+            # header warm-started from a context-token checkpoint sees an unchanged action stream
+            # at step 0 (dec_pos already separates the action indices from index 0).
+            self.state_pos = nn.Parameter(torch.zeros(1, 1, action_hidden_dim))
+        # Learned "state missing" token: substituted for the projected state (before state_pos)
+        # when state_drop_prob drops a sample. None -> legacy zero-vector drop (proj(0) = bias).
+        # Small random init so it is distinguishable from the bias at step 0.
+        self.state_null = None
+        if self.state_as_action_token and state_null_token:
+            self.state_null = nn.Parameter(torch.randn(1, 1, action_hidden_dim) * 0.02)
         # Set the action projection
         self.action_proj_in = ActionProjectionIn(
             action_pred_horizon=action_pred_horizon, 
@@ -1245,11 +1292,44 @@ class ActionTransformerModel(
         # its own VLM layer as a FRESH context (tokenized per layer, obs not carried).
         views = joint_attention_kwargs["views"]
 
-        # Random state dropout
         obs = joint_attention_kwargs["obs"]
-        if self.training and self.state_drop_prob > 0.0:
-            keep = (torch.rand(obs.shape[0], device=obs.device) >= self.state_drop_prob)
-            obs = obs * keep.view(obs.shape[0], *([1] * (obs.dim() - 1))).to(obs.dtype)
+        obs_keep = None
+        if self.state_as_action_token:
+            # State as action token 0. Dropout (per sample, train only) either zeroes the
+            # normalized state vector (legacy) or swaps in the learned state_null token; either
+            # way the token slot and state_pos stay, so the sequence layout is identical for
+            # dropped and kept samples.
+            state_vec = obs[:, -1] if obs.dim() == 3 else obs  # (B, M): latest proprio step
+            keep = None
+            if self.training and self.state_drop_prob > 0.0:
+                keep = (torch.rand(state_vec.shape[0], device=state_vec.device) >= self.state_drop_prob)
+                self.last_state_drop_frac = float((~keep).float().mean())
+                if self.state_null is None:
+                    state_vec = state_vec * keep.to(state_vec.dtype)[:, None]
+            state_proj = self.obs_proj._obs_proc[1]  # the Linear only; skip its per-dim input Dropout
+            state_token = state_proj(state_vec.to(action_hidden_states.dtype))[:, None]  # (B, 1, D)
+            if self.training and self.state_null is not None:
+                # Learned null token replaces the projected state of dropped samples. With
+                # state_drop_prob=0 `keep` is None: use an all-True keep so the where() leaves the
+                # values unchanged but state_null still gets a (zero) gradient -- DDP with
+                # find_unused_parameters=False (FinetuneTrainer) errors on the next forward if a
+                # parameter took no part in the graph.
+                if keep is None:
+                    keep = torch.ones(state_vec.shape[0], dtype=torch.bool, device=state_vec.device)
+                state_token = torch.where(
+                    keep[:, None, None], state_token, self.state_null.to(state_token.dtype)
+                )
+            state_token = state_token + self.state_pos
+            action_hidden_states = torch.cat([state_token, action_hidden_states], dim=1)  # (B, 1+Tp, D)
+            if temb.dim() == 3:
+                # RTC per-token timesteps (B, Tp, D): the state is a clean token -> t = 0.
+                t0 = torch.zeros(temb.shape[0], device=temb.device, dtype=timestep.dtype)
+                temb_state = (self.time_ins_embed(t0, pooled_projections) if self.combined_temb
+                              else self.time_ins_embed(t0))
+                temb = torch.cat([temb_state[:, None].to(temb.dtype), temb], dim=1)  # (B, 1+Tp, D)
+        elif self.training and self.state_drop_prob > 0.0:
+            # Random state dropout: drop the state TOKEN from the VLM context (legacy mode)
+            obs_keep = (torch.rand(obs.shape[0], device=obs.device) >= self.state_drop_prob).to(torch.float32)
 
         layerwise_vlm_fusion = views.shape[1] > 1
         if layerwise_vlm_fusion:
@@ -1265,6 +1345,7 @@ class ActionTransformerModel(
                     traj2ds=joint_attention_kwargs["traj2ds"],
                     text_embeddings=pooled_projections,
                     vlm_attn_mask=vlm_attn_mask,
+                    obs_keep=obs_keep,
                 )
                 per_block_obs.append(obs_i)
             obs_hidden_states = per_block_obs[0]
@@ -1274,7 +1355,8 @@ class ActionTransformerModel(
                 obs=obs,
                 traj2ds=joint_attention_kwargs["traj2ds"],
                 text_embeddings=pooled_projections,
-                vlm_attn_mask=vlm_attn_mask
+                vlm_attn_mask=vlm_attn_mask,
+                obs_keep=obs_keep,
             ) # S, B, d_model
 
         for index_block, block in enumerate(self.transformer_blocks):
@@ -1298,6 +1380,12 @@ class ActionTransformerModel(
             )
             if not layerwise_vlm_fusion:
                 obs_hidden_states = obs_out
+
+        if self.state_as_action_token:
+            # Drop the state token (and its timestep row) so the output stays (B, Tp, Da).
+            action_hidden_states = action_hidden_states[:, 1:]
+            if temb.dim() == 3:
+                temb = temb[:, 1:]
 
         action_output = self.action_proj_out(
             x=action_hidden_states,
@@ -1350,7 +1438,9 @@ class DiTActionTransformerModel(
         odim: int = 32,
         view_feature_dim: int = 1920,
         use_film: bool = False,
-        combined_temb: bool = False
+        combined_temb: bool = False,
+        dropout: float = 0.1,
+        state_feature_dropout: float = 0.2,
     ):
         super().__init__()
         # self.inner_dim = num_attention_heads * attention_head_dim
@@ -1367,7 +1457,9 @@ class DiTActionTransformerModel(
             resnet_store_path=resnet_store_path,
             odim=odim,
             view_feature_dim=view_feature_dim,
-            use_film=use_film
+            use_film=use_film,
+            dropout=dropout,
+            state_feature_dropout=state_feature_dropout,
         )
 
         total_params = sum(p.numel() for p in self.obs_proj.parameters() if p.requires_grad)
@@ -1593,6 +1685,8 @@ class Psi0Model(nn.Module):
                 action_hidden_dim=model_cfg.hidden_dim,
                 action_num_blocks=model_cfg.num_blocks,
                 pooled_projection_dim=model_cfg.pooled_projection_dim,
+                dropout=model_cfg.dropout,
+                state_feature_dropout=getattr(model_cfg, "state_feature_dropout", 0.2),
             )
         else:
             self.action_header = ActionTransformerModel(
@@ -1610,6 +1704,10 @@ class Psi0Model(nn.Module):
                 pooled_projection_dim=model_cfg.pooled_projection_dim,
                 layerwise_vlm_fusion=model_cfg.vlm_layer_indices is not None,
                 state_drop_prob=model_cfg.state_drop_prob,
+                state_as_action_token=getattr(model_cfg, "state_as_action_token", False),
+                state_null_token=getattr(model_cfg, "state_null_token", False),
+                dropout=model_cfg.dropout,
+                state_feature_dropout=getattr(model_cfg, "state_feature_dropout", 0.2),
             )
 
         total_params = sum(p.numel() for p in self.action_header.parameters())
@@ -1789,7 +1887,8 @@ class Psi0Model(nn.Module):
             vlm_attn_mask=attention_mask, # (B, seq_len)
             return_dict=return_dict,
         )
-        return HumanFoundationModelOutput(action=model_output.action, vlm_feat_norm=vlm_feat_norm)
+        return HumanFoundationModelOutput(action=model_output.action, vlm_feat_norm=vlm_feat_norm,
+                                          state_drop_frac=getattr(self.action_header, "last_state_drop_frac", None))
 
     def _collate_vlm_batch(self, batch_input_ids: List[torch.Tensor]):
         """Right-pad mixed-length samples like training's PaddedCollatorForTogether

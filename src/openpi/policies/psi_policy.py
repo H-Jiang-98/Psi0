@@ -75,3 +75,67 @@ class HfmOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # return {"actions": np.asarray(data["actions"][:, :8])}
         return data
+
+
+# 80-D = hand(14) ++ body_token(64) ++ neck(2). This is the psix ordering. The psi0
+# arm concatenates the same three groups as body_token ++ hand ++ neck, so anything
+# slicing a checkpoint's output has to know which arm produced it.
+ZEDMINI_ACTION_SLICES = {"hand": (0, 14), "body_token": (14, 78), "neck": (78, 80)}
+ZEDMINI_ACTION_DIM = ZEDMINI_ACTION_SLICES["neck"][1]
+# The hand DoF sit at the head of the pack's 36-D `action` column; the remaining 22
+# (arm / torso_rpy / base) are superseded by the 64-D body_token on this embodiment.
+ZEDMINI_HAND_DIM = ZEDMINI_ACTION_SLICES["hand"][1]
+
+
+@dataclasses.dataclass(frozen=True)
+class ZedminiInputs(transforms.DataTransformFn):
+    """ZED-mini G1 sonic+neck packs -> pi0/pi0.5 model inputs.
+
+    The packs ship one egocentric camera. The two wrist slots pi0.5 carries are
+    zero-filled and masked off, the same way HfmInputs handles single-view G1 data.
+    """
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        head_image = _parse_image(data["observation/image"])
+
+        inputs = {
+            "state": np.asarray(data["states"], dtype=np.float32),
+            "image": {
+                "base_0_rgb": head_image,
+                "left_wrist_0_rgb": np.zeros_like(head_image),
+                "right_wrist_0_rgb": np.zeros_like(head_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.False_,
+                "right_wrist_0_rgb": np.False_,
+            },
+        }
+
+        if "actions/hand" in data:
+            inputs["actions"] = np.concatenate(
+                [
+                    np.asarray(data["actions/hand"], dtype=np.float32)[..., :ZEDMINI_HAND_DIM],
+                    np.asarray(data["actions/body_token"], dtype=np.float32),
+                    np.asarray(data["actions/neck"], dtype=np.float32),
+                ],
+                axis=-1,
+            )
+
+        if "prompt" in data:
+            prompt = data["prompt"]
+            inputs["prompt"] = prompt if isinstance(prompt, str) else str(np.asarray(prompt).item())
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class ZedminiOutputs(transforms.DataTransformFn):
+    """Trims the model's padded action back to the real dims."""
+
+    action_dim: int = ZEDMINI_ACTION_DIM
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][..., : self.action_dim])}

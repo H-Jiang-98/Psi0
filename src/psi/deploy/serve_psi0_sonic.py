@@ -406,6 +406,22 @@ class Server:
         self.maxmin:ActionStateTransform = launch_config.data.transform.field # type:ignore
         self.model_transform:Psi0ModelTransform = launch_config.data.transform.model # type:ignore
 
+        # Inference is the no_aug path. The hand-rolled preprocess below runs only
+        # [resize, center_crop] and normalize_state_func (no colour jitter, no view crop,
+        # no state noise; the temporal state jitter lives in the dataset repack and never
+        # reaches the server). Pin that in the config copies too, so any future call
+        # through the transforms' __call__ -- or a run config with img_aug/view_aug/
+        # state_noise_std set -- cannot re-enable augmentation at deploy time.
+        self.transform_kwargs = {"no_aug": True}
+        self.model_transform = self.model_transform.model_copy(
+            update={k: False for k in ("img_aug", "view_aug") if hasattr(self.model_transform, k)}
+        )
+        if getattr(self.maxmin, "state_noise_std", 0.0):
+            self.maxmin = self.maxmin.model_copy(update={"state_noise_std": 0.0})
+        assert not getattr(self.model_transform, "img_aug", False) \
+            and not getattr(self.model_transform, "view_aug", False) \
+            and not getattr(self.maxmin, "state_noise_std", 0.0), "augmentation must be off at inference"
+
         self.Da = launch_config.model.action_dim # type:ignore
         self.Tp = launch_config.model.action_chunk_size # type:ignore
         self.Ta = action_exec_horizon or launch_config.model.action_exec_horizon # type:ignore
@@ -501,6 +517,8 @@ class Server:
 
     def _process_img(self, img):
         from torchvision.transforms import v2
+        # Exactly the no_aug branch of Psi0ModelTransform.__call__: resize + center_crop,
+        # nothing stochastic (see the no_aug pinning in __init__).
         transforms = [self.model_transform.resize(), self.model_transform.center_crop()]
         t = v2.Compose(transforms)
         return [t(img)]
@@ -914,6 +932,7 @@ class Server:
             "ckpt_step": self.ckpt_step,
             "dataset_name": repack.dataset_name,
             "transforms": transforms,
+            "no_aug": True,  # inference never augments images or states
             "expected_keys": {
                 "image": {k: "HxWx3 uint8 image array" for k in image_keys},
                 "state": {state_key: f"1x{state_dim} unnormalized state vector"},
@@ -947,6 +966,7 @@ class Server:
 
         # Logs were already redirected to a file in __init__ (so startup messages aren't lost). 
         dash_active = self._dash_active
+
         stop_event = threading.Event()
         dash_thread = None
         uvicorn_log_level = "info"
@@ -966,8 +986,11 @@ class Server:
             dash_thread.start()
 
         try:
+            # With the dashboard up, let uvicorn's loggers propagate to the root
+            # logger (file handler) instead of installing their own stderr handlers.
             uvicorn.run(self.app, host=host, port=port, log_level=uvicorn_log_level,
-                        access_log=not dash_active)
+                        access_log=not dash_active,
+                        log_config=None if dash_active else uvicorn.config.LOGGING_CONFIG)
         except Exception as e:
             dprint(f"Server crashed, {e}")
         finally:
@@ -977,11 +1000,34 @@ class Server:
             dprint("Server stopped.")
             exit(1)
 
+def _check_port_free(host: str, port: int) -> None:
+    """Fail loudly BEFORE the model loads / the dashboard takes the terminal.
+
+    uvicorn logs a bind failure to stderr, which the dashboard alt-screen
+    swallows, so the only trace used to be a bare "Server stopped." 0.3s after
+    "Server listens on ...". Typical culprit: another user's `ssh -L <port>:...`
+    tunnel holding localhost:<port>.
+    """
+    import socket
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind((host, port))
+    except OSError as e:
+        console.print(f"[!] cannot bind {host}:{port} ({e.strerror}). Something else is listening on "
+                      f"port {port} — check `ss -ltnpe | grep {port}` (an ssh -L tunnel from another "
+                      f"user also counts) or pick another port with --port.", style="red")
+        sys.exit(1)
+    finally:
+        probe.close()
+
+
 def serve(cfg: ServerConfig) -> None:
     overwatch.info("Server :: Initializing Policy")
     assert cfg.policy is not None, "which policy to serve?"
     assert cfg.rtc, "this server is for rtc"
     assert type(cfg.ckpt_step) == int, "ckpt_step must be specified"
+    _check_port_free(cfg.host, cfg.port)
     server = Server(
         cfg.policy, 
         Path(cfg.run_dir), 

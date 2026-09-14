@@ -808,7 +808,9 @@ class PosttrainTrainer(Trainer):
         os.makedirs(save_dir, exist_ok=True)
         ckpt_dir = os.path.join(save_dir, f"ckpt_{global_step}")
         
-        self.accelerator.save_model(self.model, ckpt_dir)
+        # For DDP, save_state() below already writes the complete model
+        if self.train_cfg.data_parallel != "ddp":
+            self.accelerator.save_model(self.model, ckpt_dir)
         return super().save_checkpoint(global_step)
 
     def evaluate(self) -> dict[str, float] | None:

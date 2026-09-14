@@ -290,6 +290,7 @@ def main():
     if args.root_dir:
         data_cfg.root_dir = args.root_dir
     if args.repo_id:
+        data_cfg.root_dir =  args.root_dir
         data_cfg.train_repo_ids = [args.repo_id]
         data_cfg.val_repo_ids = [args.repo_id]
         overwatch.warning(f"dataset overridden to {data_cfg.root_dir}/{args.repo_id} — L1 is "

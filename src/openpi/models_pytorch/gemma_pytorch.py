@@ -16,10 +16,17 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        image_resolution: tuple[int, int] = (224, 224),
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
+
+        # SigLIP's position embedding is a learned table sized for the pretrained
+        # square canvas. Off-canvas inputs are only valid if the tower is asked to
+        # bicubic-interpolate that table onto the new patch grid.
+        self.image_resolution = tuple(image_resolution)
+        self.interpolate_pos_encoding = self.image_resolution != (224, 224)
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -83,7 +90,14 @@ class PaliGemmaWithExpertModel(nn.Module):
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+        if not self.interpolate_pos_encoding:
+            return self.paligemma.model.get_image_features(image)
+        # PaliGemma.get_image_features() calls the tower without forwarding
+        # `interpolate_pos_encoding`, which pins the grid at 16x16. Inline the same
+        # two steps -- vision tower, then multimodal projector -- with the flag set.
+        model = self.paligemma.model
+        image_outputs = model.vision_tower(image, interpolate_pos_encoding=True)
+        return model.multi_modal_projector(image_outputs.last_hidden_state)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)

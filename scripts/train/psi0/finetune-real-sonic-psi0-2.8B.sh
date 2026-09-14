@@ -64,6 +64,14 @@ export OMP_NUM_THREADS=32
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 source "${PSI_VENV:-$([ -d /workspace/.venv-psi ] && echo /workspace/.venv-psi || echo .venv-psi)}/bin/activate"
+DATA_ROOT=${DATA_ROOT:-.data/teleop5_round2_wm_train_val_full_cleaned}
+TRAIN_IDS=${TRAIN_IDS:-teleop5_lerobot_psix_train/g1}
+VAL_IDS=${VAL_IDS:-teleop5_lerobot_psix_val/g1}
+# Norm stats: this pack ships meta/stats.json (min/max/q01/q99 for action,
+# action.body_token_v1_1, action.neck, observation.state) -- there is no stats_psi0.json
+# here, unlike the g1_sonic/psix_sonic packs. Path is resolved relative to the project
+# root by resolve_path().
+STATS=${STATS:-$DATA_ROOT/$TRAIN_IDS/meta/stats.json}
 
 NPROC_PER_NODE=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 ulimit -n 65535
@@ -71,7 +79,7 @@ echo "Training with $NPROC_PER_NODE GPUs"
 
 if [ "$#" -lt 1 ]; then
     echo "Usage: $0 <task> [exp]"
-    echo "Example: $0 Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new_target_yaw pick-toys"
+    echo "Example: $0 psi0 baseline"
     exit 1
 fi
 
@@ -83,8 +91,37 @@ export exp=${2:-$default_exp}
 echo "Task: $task"
 echo "Experiment name: $exp"
 
+# --- warm-start preflight ----------------------------------------------------
+# Split the post-trained checkpoint into the VLM dir + action_header.safetensors that
+# the two --model flags below want. ~11 GB, written once and reused; the exporter
+# stages into <dir>.partial and renames, so a waiting node never sees a half file.
+POSTTRAIN_RUN="${POSTTRAIN_RUN:-.runs/posttrain/dropout.us.flow1000.cosine.lr1.0e-04.b256.gpus8.2609012205}"
+CKPT_STEP="${CKPT_STEP:-40000}"
+CKPT_DIR="$POSTTRAIN_RUN/checkpoints/ckpt_$CKPT_STEP"
+INIT_DIR="$POSTTRAIN_RUN/posttrained/ckpt_$CKPT_STEP"
+
+if [ ! -s "$INIT_DIR/model.safetensors" ] || [ ! -s "$INIT_DIR/action_header.safetensors" ]; then
+    [ -s "$CKPT_DIR/model.safetensors" ] || { echo "FATAL: missing $CKPT_DIR/model.safetensors" >&2; exit 1; }
+    if [ "$NODE_RANK" -eq 0 ]; then
+        echo "Exporting post-trained weights: $CKPT_DIR -> $INIT_DIR"
+        python3 scripts/export_psi0_ckpt.py "$CKPT_DIR" "$INIT_DIR" \
+            || { echo "FATAL: export_psi0_ckpt.py failed" >&2; exit 1; }
+    else
+        echo "Waiting for node 0 to export $INIT_DIR ..."
+        for _ in $(seq 1 180); do
+            [ -s "$INIT_DIR/model.safetensors" ] && [ -s "$INIT_DIR/action_header.safetensors" ] && break
+            sleep 10
+        done
+    fi
+fi
+for f in config.json model.safetensors action_header.safetensors; do
+    [ -s "$INIT_DIR/$f" ] \
+        || { echo "FATAL: $INIT_DIR/$f missing (rerun: python3 scripts/export_psi0_ckpt.py $CKPT_DIR $INIT_DIR)" >&2; exit 1; }
+done
+echo "Warm start from $INIT_DIR (VLM + action header, ckpt_$CKPT_STEP)"
+
 args="
-finetune_real_psi0_config \
+finetune_sonic_psi0_config \
 --seed=292285 \
 --exp=$exp \
 --train.name=finetune \
@@ -99,33 +136,43 @@ finetune_real_psi0_config \
 --train.warmup_steps=1000 \
 --train.checkpointing_steps=5000 \
 --train.validation_steps=1000 \
---train.val_num_batches=20 \
+--train.val_num_batches=100 \
 --train.max_grad_norm=1.0 \
 --train.lr_scheduler_type=cosine \
 --train.lr_scheduler_kwargs.weight_decay=1e-6 \
 --train.lr_scheduler_kwargs.betas 0.95 0.999 \
 --log.report_to=wandb \
---data.root_dir=/hfm/data/sonic/lerobot \
---data.train_repo_ids=$task \
---data.transform.field.stat-path=meta/stats_psi0.json \
---data.transform.field.stat-action-key=action \
---data.transform.field.stat-state-key=states \
+--data.root_dir=$DATA_ROOT \
+--data.train_repo_ids $TRAIN_IDS \
+--data.val_repo_ids $VAL_IDS \
+--data.transform.repack.action-keys action.body_token_v1_1 action[:14] action.neck \
+--data.transform.repack.dataset-name=teleop5round2full \
+--data.transform.repack.pad-action-dim=80 \
+--data.transform.repack.pad-state-dim=45 \
+--data.transform.repack.instruction-key=task_description \
+--data.transform.field.stat-path=$STATS \
+--data.transform.field.stat-action-keys action.body_token_v1_1 action[:14] action.neck \
+--data.transform.field.stat-state-keys observation.state \
 --data.transform.field.action_norm_type=bounds \
 --data.transform.field.no-use-norm-mask \
 --data.transform.field.normalize-state \
+--data.transform.field.pad-action-dim=80 \
+--data.transform.field.pad-state-dim=45 \
 --data.transform.model.img-aug \
---data.transform.model.resize.size 240 320 \
---data.transform.model.center_crop.size 240 320 \
---model.model_name_or_path=/hfm/cache/checkpoints/psi0/pre.fast.1by1.2601091803.ckpt.ego200k.he30k \
---model.pretrained-action-header-path=/hfm/cache/checkpoints/psi0/postpre.1by1.pad36.2601131206.ckpt.he30k \
+--data.transform.model.resize.size 270 480 \
+--data.transform.model.center_crop.size 270 480 \
+--model.model_name_or_path=$INIT_DIR \
+--model.pretrained-action-header-path=$INIT_DIR \
 --model.noise-scheduler=flow \
 --model.train-diffusion-steps=1000 \
 --model.n_conditions=0 \
 --model.action-chunk-size=30 \
---model.action-dim=78 \
+--model.action-dim=80 \
 --model.action-exec-horizon=30 \
 --model.observation-horizon=1 \
---model.odim=43 \
+--model.odim=45 \
+--model.dropout=0.0 \
+--model.state-feature-dropout=0.0 \
 --model.view_feature_dim=2048 \
 --model.tune-vlm \
 --model.lang-backbone-lr=1e-6 \
@@ -137,7 +184,7 @@ finetune_real_psi0_config \
 --model.combined-temb \
 --model.num-blocks=12 \
 --model.vlm-layer-indices 3 5 8 10 12 14 17 19 21 23 26 28 \
---model.state-drop-prob=0.8 \
+--model.state-drop-prob=0.1 \
 --model.pooled-text-encoder=clip \
 --model.pooled-text-encoder-path=openai/clip-vit-large-patch14 \
 --model.pooled-projection-dim=768 \

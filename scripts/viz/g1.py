@@ -4,10 +4,11 @@ HAND_JOINT_NAMES = [
     "left_hand_thumb_0_joint",
     "left_hand_thumb_1_joint",
     "left_hand_thumb_2_joint",
-    "left_hand_index_0_joint",
-    "left_hand_index_1_joint",
     "left_hand_middle_0_joint",
     "left_hand_middle_1_joint",
+    "left_hand_index_0_joint",
+    "left_hand_index_1_joint",
+    
     "right_hand_thumb_0_joint",
     "right_hand_thumb_1_joint",
     "right_hand_thumb_2_joint",

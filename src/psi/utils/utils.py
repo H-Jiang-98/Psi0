@@ -216,7 +216,6 @@ def resolve_path(path: Union[str, Path], subdir="data", auto_download=False) -> 
                 local_dir=os.getcwd(),
                 repo_type="dataset",
                 # resume_download=True,
-                # token="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",
             )
             # print(data_dir);exit(0)
             # zip_path = os.path.join(data_dir, zip_file)
@@ -538,20 +537,50 @@ def cfg_json_default(o):
 #     True (today's default) is `LayerNorm(x) * (1 + scale) + shift`. Both have the
 #     same weights, so a legacy checkpoint loads clean and then emits garbage
 #     actions -- the policy runs, the robot fails the task.
+#   state_drop_prob / state_as_action_token: proprio-state handling. Pre-flag runs
+#     were trained with the state as an always-present token in the VLM context, i.e.
+#     no dropout and no action-stream token. These currently equal the class defaults
+#     and are listed so the trained-with value survives any future default change.
+#   state_null_token: added after state_as_action_token, so runs from between the two
+#     flags carry the former but not the latter. All of them were trained WITHOUT the
+#     learned null token; a True default would hand them a fresh, untrained parameter
+#     that state_drop_prob>0 would then substitute in.
+#   dropout / state_feature_dropout: both were HARD-CODED in ObservationProjection (0.1 on
+#     the context tokens, 0.2 element-wise on the raw state) and ignored the config until
+#     they were wired up. Every pre-wiring run_config.json happens to record dropout=0.1,
+#     the value that was actually compiled in, so that one is a no-op today and is listed
+#     only to pin it against a future default change. state_feature_dropout did not exist,
+#     so it MUST be back-filled to 0.2 -- today's recipes set 0.0, and taking that default
+#     for a legacy checkpoint would serve a state encoder the weights were not trained for.
+#
+# The value recorded here is what the checkpoint was TRAINED with, regardless of the
+# current class default; the loader only warns when the two differ.
 LEGACY_MODEL_CONFIG_DEFAULTS: dict[str, Any] = {
     "final_layer_norm": False,
+    "state_drop_prob": 0.0,
+    "state_as_action_token": False,
+    "state_null_token": False,
+    "dropout": 0.1,
+    "state_feature_dropout": 0.2,
 }
 
 def apply_legacy_model_config_defaults(conf: dict[str, Any]) -> dict[str, Any]:
-    """Fill model-config keys a pre-flag run_config.json does not carry (in place)."""
+    """Fill model-config keys a pre-flag run_config.json does not carry (in place).
+
+    Warns only when the back-filled value differs from today's class default, i.e.
+    when relying on pydantic's default would have changed the loaded model's forward.
+    """
     model_conf = conf.get("model")
     if not isinstance(model_conf, dict):
         return conf
+    from psi.config.model_psi0 import Psi0ModelConfig  # local: psi.config imports psi.utils
     for key, legacy_value in LEGACY_MODEL_CONFIG_DEFAULTS.items():
         if key not in model_conf:
             model_conf[key] = legacy_value
-            print(f"[legacy ckpt] run_config.json predates `model.{key}`; "
-                  f"serving with {key}={legacy_value} (the value it was trained with)")
+            field = Psi0ModelConfig.model_fields.get(key)
+            if field is None or field.default != legacy_value:
+                print(f"[legacy ckpt] run_config.json predates `model.{key}`; "
+                      f"serving with {key}={legacy_value} (the value it was trained with)")
     return conf
 
 def load_launch_config(run_dir: Path | str):

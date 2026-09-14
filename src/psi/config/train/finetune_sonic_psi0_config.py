@@ -1,4 +1,5 @@
 from typing import Any, Union, Annotated
+from typing_extensions import Self
 from pydantic import BaseModel, Field, model_validator
 
 from psi.config.config import LaunchConfig
@@ -21,11 +22,27 @@ class DynamicLaunchConfig(LaunchConfig):
     model: Psi0ModelConfig
 
     @model_validator(mode="after")
-    def check_observation_dim(self, __context: Any) -> None:
-        assert self.data.transform.repack.pad_action_dim == self.data.transform.field.pad_action_dim, "inconsistent action dim"
-        assert self.data.transform.repack.pad_state_dim == self.data.transform.field.pad_state_dim, "inconsistent state dim"
-        assert self.model.odim == self.data.transform.repack.pad_state_dim, "inconsitent odim"
-        assert self.model.action_chunk_size == self.data.transform.repack.action_chunk_size, "inconsistent action chunk size"
+    def check_observation_dim(self, __context: Any) -> Self:
+        repack, field = self.data.transform.repack, self.data.transform.field
+        assert repack.pad_action_dim == field.pad_action_dim, (
+            f"inconsistent action dim: --data.transform.repack.pad-action-dim="
+            f"{repack.pad_action_dim} vs --data.transform.field.pad-action-dim="
+            f"{field.pad_action_dim} (set both)"
+        )
+        assert repack.pad_state_dim == field.pad_state_dim, (
+            f"inconsistent state dim: --data.transform.repack.pad-state-dim="
+            f"{repack.pad_state_dim} vs --data.transform.field.pad-state-dim="
+            f"{field.pad_state_dim} (set both)"
+        )
+        assert self.model.odim == repack.pad_state_dim, (
+            f"inconsistent odim: --model.odim={self.model.odim} vs "
+            f"--data.transform.repack.pad-state-dim={repack.pad_state_dim}"
+        )
+        assert self.model.action_chunk_size == repack.action_chunk_size, (
+            f"inconsistent action chunk size: --model.action-chunk-size="
+            f"{self.model.action_chunk_size} vs --data.transform.repack.action-chunk-size="
+            f"{repack.action_chunk_size}"
+        )
         if self.model.vlm_layer_indices is not None:
             assert self.model.num_blocks == len(self.model.vlm_layer_indices), (
                 f"inconsistent number of blocks: num_blocks={self.model.num_blocks} but "

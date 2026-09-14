@@ -7,7 +7,7 @@ def start_client():
     socket = context.socket(zmq.REQ)
     
     server_ip = "192.168.123.164" 
-    socket.connect(f"tcp://{server_ip}:5556")
+    socket.connect(f"tcp://{server_ip}:5558")
 
     print(f"Connected to server at {server_ip}")
     print("Press 'q' to exit.")

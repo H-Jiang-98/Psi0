@@ -90,15 +90,22 @@ class PI0Pytorch(nn.Module):
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
+        self.image_resolution = tuple(getattr(config, "image_resolution", _preprocessing.IMAGE_RESOLUTION))
+
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            image_resolution=self.image_resolution,
         )
 
-        self.action_in_proj = nn.Linear(36, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, 36)
+        # The action bridge is as wide as the padded action/state dim -- `PadStatesAndActions`
+        # pads both to `action_dim`. Psi-0 ran this at 36; the g1-sonic-neck packs need 80
+        # (hand 14 + body_token 64 + neck 2), so read it off the config instead of pinning
+        # one embodiment's width here.
+        self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
+        self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -160,7 +167,9 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        observation = _preprocessing.preprocess_observation_pytorch(
+            observation, train=train, image_resolution=self.image_resolution
+        )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),

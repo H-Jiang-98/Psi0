@@ -13,6 +13,7 @@ state columns are in the native sonic layout:
     state_keys  = ["observation.state"]                                -> 45
 """
 from typing import Any, Union, Annotated
+from typing_extensions import Self
 from pydantic import BaseModel, Field, model_validator
 
 from psi.config.config import LaunchConfig
@@ -38,7 +39,7 @@ class DynamicLaunchConfig(LaunchConfig):
     model: Psi0ModelConfig
 
     @model_validator(mode="after")
-    def check_observation_dim(self, __context: Any) -> None:
+    def check_observation_dim(self, __context: Any) -> Self:
         assert self.data.transform.repack.pad_action_dim == self.data.transform.field.pad_action_dim, "inconsistent action dim"
         assert self.data.transform.repack.pad_state_dim == self.data.transform.field.pad_state_dim, "inconsistent state dim"
         assert self.model.odim == self.data.transform.repack.pad_state_dim, "inconsitent odim"

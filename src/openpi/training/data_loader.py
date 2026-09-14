@@ -137,20 +137,25 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = LeRobotDatasetMetadata(repo_id)
-    dataset = LeRobotDataset(
-        "psi",
-        root=data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-        # video_backend="pyav",
-    )
+    roots = list(data_config.repo_roots) if data_config.repo_roots else [repo_id]
 
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    dataset_meta = LeRobotDatasetMetadata("psi", root=roots[0])
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
 
-    return dataset
+    def _one(root: str):
+        # torchcodec imports in these venvs -- so lerobot's get_safe_default_codec picks
+        # it -- but dies loading libtorchcodec at the first decode because the FFmpeg
+        # shared libs are absent. psi's own loaders pin pyav for the same reason.
+        ds = LeRobotDataset("psi", root=root, delta_timestamps=delta_timestamps, video_backend="pyav")
+        if data_config.prompt_from_task:
+            return TransformedDataset(ds, [_transforms.PromptFromLeRobotTask(ds.meta.tasks)])
+        return ds
+
+    if len(roots) == 1:
+        return _one(roots[0])
+    return torch.utils.data.ConcatDataset([_one(root) for root in roots])
 
 
 def create_rlds_dataset(

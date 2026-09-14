@@ -31,6 +31,9 @@ def _condition_key(meta: Dict[str, Any] | None):
     return (meta.get("vla_session_id"), meta.get("condition_id"))
 
 
+PSI0_RTC_GUIDANCE_ALPHA = 0.9  # psi0 parity (serve_psi0_sonic hardcodes 0.9)
+
+
 class RealTimeChunkInference:
     # Horizons/delays below are counted in control-loop ticks (1 tick = 1/ctrl_hz s).
     def __init__(
@@ -335,15 +338,15 @@ class RealTimeChunkInference:
             # the worst case for a no-rtc one, and not an open-loop baseline at all.
             return self._predict_action(observation)
         if self.rtc_mode == "test_time":
-            # Inference-time guidance: no sigma-0 prefix, so a checkpoint trained
-            # WITHOUT rtc stays in-distribution. trained_max_delay is meaningless
-            # here (the ckpt never had a delay budget) and is not passed.
-            # The goal image is a plain input on this path, not CFG-only.
-            actions = self.policy.predict_action_with_test_time_rtc(
+            # psi0 test-time RTC: guidance towards the previous chunk instead of a
+            # sigma-0 prefix, so a checkpoint trained WITHOUT rtc stays in
+            # distribution. trained_max_delay is meaningless here and is not passed.
+            return self.policy.predict_action_with_rtc_flow(
                 observations=[obs_tensor],
                 states=observation['states'].unsqueeze(0).to(self.policy.device),
                 instructions=[observation['instruction']],
                 num_inference_steps=8,
+                traj2ds=None,
                 prev_actions=prev,
                 inference_delay=inference_delay,
                 execution_horizon=self.min_exec_horizon,
@@ -354,24 +357,23 @@ class RealTimeChunkInference:
                 guidance_mode=self.pig_guidance_mode,
                 guidance_alpha=self.pig_guidance_alpha,
             )[0].float().detach().cpu().numpy()
-        else:
-            actions = self.policy.predict_action_with_training_rtc_flow(
-                observations=[obs_tensor],
-                states=observation['states'].unsqueeze(0).to(self.policy.device),  # (Ts,Ds) -> (1,Ts,Ds)
-                instructions=[observation['instruction']],
-                num_inference_steps=8,
-                prev_actions=prev,
-                inference_delay=inference_delay,
-                max_delay=self.trained_max_delay,
-                # Forward the goal ALWAYS. It is not a CFG-only input: _build_qwen_inputs
-                # appends it to the prompt whenever it is not None, and cfg_scale only
-                # decides whether a second unconditional row is built. Gating it on
-                # cfg_scale != 1.0 (our standing config is 1.0) silently ran this
-                # goal-conditioned checkpoint with no goal frame at all.
-                goal_images=goals,
-                cfg_scale=self.cfg_scale,
-                cfg_uncond_strip_subtask=self.cfg_uncond_strip_subtask,
-            )[0].float().detach().cpu().numpy()  # (1, H, Da) -> (H, Da)
+        actions = self.policy.predict_action_with_training_rtc_flow(
+            observations=[obs_tensor],
+            states=observation['states'].unsqueeze(0).to(self.policy.device),  # (Ts,Ds) -> (1,Ts,Ds)
+            instructions=[observation['instruction']],
+            num_inference_steps=8,
+            prev_actions=prev,
+            inference_delay=inference_delay,
+            max_delay=self.trained_max_delay,
+            # Forward the goal ALWAYS. It is not a CFG-only input: _build_qwen_inputs
+            # appends it to the prompt whenever it is not None, and cfg_scale only
+            # decides whether a second unconditional row is built. Gating it on
+            # cfg_scale != 1.0 (our standing config is 1.0) silently ran this
+            # goal-conditioned checkpoint with no goal frame at all.
+            goal_images=goals,
+            cfg_scale=self.cfg_scale,
+            cfg_uncond_strip_subtask=self.cfg_uncond_strip_subtask,
+        )[0].float().detach().cpu().numpy()  # (1, H, Da) -> (H, Da)
         return actions
 
     def _predict_action(self, o):

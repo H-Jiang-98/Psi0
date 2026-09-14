@@ -31,12 +31,21 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # ViT input canvas (height, width). The SigLIP tower was pretrained at 224x224
+    # (patch 14 -> a 16x16 grid, 256 tokens per image); any other canvas is served by
+    # bicubic-interpolating the learned position embeddings. Read by both the
+    # ModelTransformFactory (data-side resize) and PI0Pytorch (model-side resize
+    # guard), which is why it lives here rather than in either call site -- the two
+    # disagreeing would silently resize the image twice.
+    image_resolution: tuple[int, int] = _model.IMAGE_RESOLUTION
 
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        # tyro hands tuples back as lists; normalise so `!= (224, 224)` is meaningful.
+        object.__setattr__(self, "image_resolution", tuple(self.image_resolution))
 
     @property
     @override
@@ -53,7 +62,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_spec = jax.ShapeDtypeStruct([batch_size, *self.image_resolution, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():

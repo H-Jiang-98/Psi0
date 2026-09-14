@@ -1013,7 +1013,14 @@ class Psi0ModelTransform(ModelTransform):
     color_jitter: ColorJitter = Field(default_factory=lambda: ColorJitter())
     gaussian_noise: GaussianNoise = Field(default_factory=lambda: GaussianNoise(mean=0, std=3, prob_skip=0.1))
     img_aug: bool = False
-    
+
+    # Random crop-and-resize-back viewport perturbation, applied after resize+center_crop
+    # at that resolution, before the color jitter. Like img_aug it is skipped when the
+    # caller passes no_aug=True (val split, deploy, mock clients).
+    view_aug: bool = False
+    view_aug_min_scale: float = 0.85
+    view_aug_prob: float = 1.0
+
     # for mixed dataset with different image sizes
     adaptive_resize: bool = False
     img_sizes: dict[str, Any] = Field(default_factory=lambda: {
@@ -1028,7 +1035,9 @@ class Psi0ModelTransform(ModelTransform):
             ...
             data["observations"]: List of PIL Images
         """
-        do_img_aug = False if no_aug else self.img_aug
+        # no_aug=True (val split, deploy, mock clients) disables every image augmentation.
+        do_img_aug = self.img_aug and not no_aug
+        do_view_aug = self.view_aug and not no_aug
         if self.adaptive_resize:
             assert data["dataset"] is not None
             match data["dataset"]:
@@ -1040,16 +1049,22 @@ class Psi0ModelTransform(ModelTransform):
                     target_size = (256, 256)
             resizer = ResizeImage(size=tuple(target_size))() # type: ignore
             center_crop = CenterCrop(size=tuple(target_size))() # type: ignore
+            view_size = tuple(target_size)
         else:
             resizer = self.resize()
             center_crop = self.center_crop()
-            
+            view_size = self.center_crop.size
+            if isinstance(view_size, int):
+                view_size = (view_size, view_size)
+
         t1 = v2.Compose([
             resizer,
             center_crop,
+            RandomViewPerturb(size=tuple(view_size), min_scale=self.view_aug_min_scale, prob=self.view_aug_prob)()
+                if do_view_aug else v2.Identity(),
             self.color_jitter() if do_img_aug else v2.Identity(),
         ])
-        
+
         images = [t1(img) for img in data["observations"]]
         instruction = data["instruction"]
 

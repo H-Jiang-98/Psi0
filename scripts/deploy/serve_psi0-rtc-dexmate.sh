@@ -1,11 +1,11 @@
 #!/bin/bash
 
-source .venv-psi/bin/activate
+source "${PSI_VENV:-$([ -d /workspace/.venv-psi ] && echo /workspace/.venv-psi || echo .venv-psi)}/bin/activate"
 
 export CUDA_VISIBLE_DEVICES=0
 echo "Training with $nprocs GPUs, which is/are $CUDA_VISIBLE_DEVICES"
 
-python src/psi/deploy/psi_serve_rtc-dexmate.py \
+serve_psi0_dexmate \
     --host 0.0.0.0 \
     --port 8014 \
     --action_exec_horizon 30 \
