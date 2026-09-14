@@ -23,11 +23,33 @@ export exp=${2:-$default_exp}
 echo "Task: $task"
 echo "Experiment name: $exp"
 
+# --- warm start ---------------------------------------------------------------
+# Released Psi-0 SONIC post-train (VLM + action header, 12 blocks, state token, combined temb).
+# The knobs below assume THIS header shape; the old AMO checkpoints (postpre.1by1.pad36...,
+# 6 blocks, no state token) do not fit them. Override with INIT_DIR=... if staged elsewhere.
+INIT_DIR="${INIT_DIR:-/hfm/cache/checkpoints/psi0/postpre.sonic1.0.unifolm.2609092156.40k}"
+for f in config.json model.safetensors action_header.safetensors; do
+    [ -s "$INIT_DIR/$f" ] || { echo "FATAL: $INIT_DIR/$f missing" >&2; exit 1; }
+done
+echo "Warm start from $INIT_DIR (VLM + action header)"
+
+# --- robustness knobs (ported from finetune-sonic-psi-dream-baseline.sh) --------
+STATE_DROP_PROB="${STATE_DROP_PROB:-0.1}"     # per-sample state drop -> learned null token; 0 disables
+STATE_JITTER="${STATE_JITTER:-10}"            # frames; 0 disables the temporal state aug
+STATE_JITTER_PROB="${STATE_JITTER_PROB:-0.5}"
+STATE_NOISE_STD="${STATE_NOISE_STD:-0.05}"    # in normalized [-1,1] units; 0 disables
+VIEW_AUG_MIN_SCALE="${VIEW_AUG_MIN_SCALE:-0.85}"
+VIEW_AUG_PROB="${VIEW_AUG_PROB:-1.0}"
+echo "State aug: drop=${STATE_DROP_PROB} (learned null token) jitter=+-${STATE_JITTER}f p=${STATE_JITTER_PROB} noise=${STATE_NOISE_STD}; view aug: min_scale=${VIEW_AUG_MIN_SCALE} p=${VIEW_AUG_PROB}"
+
+# --train.name=finetune is REQUIRED: only FinetuneTrainer implements the frozen CLIP pooled
+# text encoder behind --model.combined-temb, the per-component VLM optimizer groups
+# (--model.*-lr) and the state_drop_frac logging.
 args="
 finetune_real_psi0_config \
 --seed=292285 \
 --exp=$exp \
---train.name=sonic \
+--train.name=finetune \
 --train.data_parallel=ddp \
 --train.mixed_precision=bf16 \
 --train.train_batch_size=16 \
@@ -47,30 +69,56 @@ finetune_real_psi0_config \
 --log.report_to=wandb \
 --data.root_dir=/hfm/data/sonic/lerobot \
 --data.train_repo_ids=$task \
+--data.transform.repack.pad-action-dim=80 \
+--data.transform.repack.pad-state-dim=45 \
+--data.transform.repack.state-temporal-jitter=$STATE_JITTER \
+--data.transform.repack.state-temporal-jitter-prob=$STATE_JITTER_PROB \
 --data.transform.field.stat-path=meta/stats_psi0.json \
 --data.transform.field.stat-action-key=action \
 --data.transform.field.stat-state-key=states \
+--data.transform.field.state-noise-std=$STATE_NOISE_STD \
 --data.transform.field.action_norm_type=bounds \
 --data.transform.field.no-use-norm-mask \
 --data.transform.field.normalize-state \
+--data.transform.field.pad-action-dim=80 \
+--data.transform.field.pad-state-dim=45 \
 --data.transform.model.img-aug \
+--data.transform.model.view-aug \
+--data.transform.model.view-aug-min-scale=$VIEW_AUG_MIN_SCALE \
+--data.transform.model.view-aug-prob=$VIEW_AUG_PROB \
 --data.transform.model.resize.size 240 320 \
 --data.transform.model.center_crop.size 240 320 \
---model.model_name_or_path=/hfm/cache/checkpoints/psi0/pre.fast.1by1.2601091803.ckpt.ego200k.he30k \
---model.pretrained-action-header-path=/hfm/cache/checkpoints/psi0/postpre.1by1.pad36.2601131206.ckpt.he30k \
+--model.model_name_or_path=$INIT_DIR \
+--model.pretrained-action-header-path=$INIT_DIR \
 --model.noise-scheduler=flow \
 --model.train-diffusion-steps=1000 \
 --model.n_conditions=0 \
 --model.action-chunk-size=30 \
---model.action-dim=78 \
+--model.action-dim=80 \
 --model.action-exec-horizon=30 \
 --model.observation-horizon=1 \
---model.odim=43 \
+--model.odim=45 \
+--model.dropout=0.0 \
+--model.state-feature-dropout=0.0 \
 --model.view_feature_dim=2048 \
---model.no-tune-vlm \
+--model.tune-vlm \
+--model.lang-backbone-lr=1e-6 \
+--model.vision-tower-lr=1e-5 \
+--model.mm-projector-lr=1e-4 \
+--model.gradient-checkpointing \
 --model.no-use_film \
---model.no-combined_temb \
---model.rtc \
+--model.qk-norm=rms_norm \
+--model.combined-temb \
+--model.num-blocks=12 \
+--model.vlm-layer-indices 3 5 8 10 12 14 17 19 21 23 26 28 \
+--model.state-drop-prob=$STATE_DROP_PROB \
+--model.state-as-action-token \
+--model.state-null-token \
+--model.pooled-text-encoder=clip \
+--model.pooled-text-encoder-path=openai/clip-vit-large-patch14 \
+--model.pooled-projection-dim=768 \
+--model.pooled-cache-path=clip_pooled_cache.pt \
+--model.no-rtc \
 --model.max-delay=8
 "
 
