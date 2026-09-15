@@ -40,8 +40,15 @@ psi = ["assets/*"]
 
 [tool.uv.sources]
 psi = { path = ".", editable = true }
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
 #simple = { path = "third_party/SIMPLE", editable = true }
 #nvidia-curobo = { path = "third_party/SIMPLE/third_party/curobo", editable = true }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.uv.workspace]
 members = ["packages/*"]

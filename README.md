@@ -102,8 +102,9 @@ GIT_LFS_SKIP_SMUDGE=1 uv sync \
   --group viz \
   --group psi \
   --index-strategy unsafe-best-match \
+  --default-index https://mirrors.aliyun.com/pypi/simple/ \
   --active
-uv pip install flash_attn==2.7.4.post1 --no-build-isolation
+uv pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
 ```
 
 
@@ -729,13 +730,22 @@ uv pip uninstall wandb
 uv pip install wandb==0.18.0
 ```
 
-5. support `sm_120` on newer GPUs like `5090` or `RTX 6000`, UserWarning: Ignoring invalid value for boolean flag CUDA_LAUNCH_BLOCKING: truevalid values are 0 or 1.
+5. Support `sm_120` on newer GPUs like `5090` or `RTX 6000`.
 
-update `torch` and `flash-attn`
+The project pins the CUDA 12.8 PyTorch index in `pyproject.toml`. Resync the
+environment and reinstall the prebuilt FlashAttention wheel:
 ```
-uv pip uninstall torch torchvision
-uv pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install flash-attn --no-build-isolation
+source .venv-psi/bin/activate
+GIT_LFS_SKIP_SMUDGE=1 uv sync \
+  --group serve \
+  --group viz \
+  --group psi \
+  --index-strategy unsafe-best-match \
+  --default-index https://mirrors.aliyun.com/pypi/simple/ \
+  --active \
+  --inexact
+uv pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl"
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())"
 ```
 
 6. Failed to download and build `lerobot ... `, Use `git lfs logs last` to view the log.
